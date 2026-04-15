@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        env:
+          ENABLE_LIVE_TRADING: "false"
+        run: |
+          python -m pytest tests/ \
+            -v \
+            --tb=short \
+            --cov=polymarket_bot \
+            --cov-report=term-missing \
+            --ignore=tests/test_integration.py \
+            -x
+
+      - name: Run integration tests
+        env:
+          ENABLE_LIVE_TRADING: "false"
+        run: |
+          python -m pytest tests/test_integration.py \
+            -v \
+            --tb=short \
+            -m integration
+
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dev deps
+        run: pip install ruff mypy
+
+      - name: Ruff lint
+        run: ruff check polymarket_bot/ --select=E,F,W
+
+      - name: Type check (mypy)
+        run: mypy polymarket_bot/ --ignore-missing-imports --no-strict-optional
+        continue-on-error: true  # Warnings, not hard failure

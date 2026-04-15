@@ -1,0 +1,79 @@
+# Polymarket Bot - Conservative Default Configuration
+# All monetary values in USD. Override via environment variables or a custom YAML.
+
+paper_mode: true
+enable_live_trading: false
+first_live_trades_manual_review: 10
+
+# Minimum expected value to generate a signal (as fraction: 0.02 = 2%)
+ev_threshold: 0.02
+min_confidence: 0.6
+
+# --- Layer 0: Hard Limits ---
+risk:
+  global_exposure_usd: 10000
+  per_market_exposure_usd: 1000
+  per_trade_max_usd: 500
+  max_concurrent_positions: 10
+
+  # --- Layer 1: Position Sizing ---
+  kelly_fraction: 0.25          # Quarter-Kelly (conservative)
+  min_liquidity_usd: 5000       # Skip illiquid markets
+
+  # --- Layer 2: Execution Controls ---
+  slippage_tolerance_pct: 0.02
+  max_fill_price_deviation_pct: 0.03
+  order_ttl_seconds: 300
+
+  # --- Layer 3: Stop & Time Decay ---
+  stop_loss_pct: 0.15
+  time_decay_hours: 48          # Close positions approaching resolution
+
+  # --- Layer 4: Portfolio Hedging ---
+  correlation_threshold: 0.7
+  max_category_exposure_pct: 0.4
+
+  # --- Layer 5: Circuit Breakers ---
+  drawdown_circuit_breaker_pct: 0.10
+  anomalous_fill_threshold: 3.0  # Std deviations from mean fill
+  max_daily_loss_usd: 2000
+
+execution:
+  prefer_limit_orders: true
+  market_order_slippage_cap_pct: 0.03
+  order_timeout_seconds: 60
+  retry_max_attempts: 3
+  retry_backoff_base_seconds: 2.0
+
+scanner:
+  poll_interval_seconds: 30
+  websocket_enabled: true
+  categories:
+    - crypto
+    - finance
+    - technology
+    - politics
+    - sports
+  min_volume_usd: 1000
+  min_liquidity_usd: 2000
+  max_markets: 200
+
+copy_trade_detection:
+  time_window_seconds: 600
+  similarity_threshold: 0.8
+  response: reduce_size
+  enabled: true
+  watchlist_max_size: 100
+
+alerts:
+  alert_on_circuit_breaker: true
+  alert_on_copy_trade: true
+  alert_on_large_fill: true
+  large_fill_threshold_usd: 500
+
+rate_limits:
+  orders_per_10s: 50
+  data_requests_per_10s: 100
+  max_ws_connections: 3
+  backoff_base_seconds: 1.0
+  backoff_max_seconds: 60.0

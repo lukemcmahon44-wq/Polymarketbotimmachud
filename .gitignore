@@ -1,0 +1,41 @@
+# Secrets - NEVER commit
+.env
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Logs and data
+logs/
+*.log
+data/
+backtest_results/
+
+# OS
+.DS_Store
+Thumbs.db

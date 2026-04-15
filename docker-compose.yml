@@ -1,0 +1,59 @@
+version: "3.9"
+
+# ---------------------------------------------------------------
+# Polymarket Trading Bot — Local Paper-Mode Testing
+# ---------------------------------------------------------------
+# Usage:
+#   docker compose up               # Paper mode bot
+#   docker compose run backtest     # Run backtest
+#   docker compose run tests        # Run test suite
+#
+# NOTE: ENABLE_LIVE_TRADING is explicitly set to false here.
+# Live trading requires a separate deployment with secure secrets.
+# ---------------------------------------------------------------
+
+services:
+
+  bot:
+    build: .
+    container_name: polybot_paper
+    command: ["run", "--paper"]
+    environment:
+      - ENABLE_LIVE_TRADING=false   # NEVER change this for local testing
+      - CONFIG_PATH=config/default.yaml
+      - LOG_LEVEL=INFO
+      - POLYGON_RPC_URL=${POLYGON_RPC_URL:-https://polygon-rpc.com}
+      # Do NOT add POLYMARKET_PRIVATE_KEY here — use .env.secrets for live
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import polymarket_bot; print('ok')"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  backtest:
+    build: .
+    container_name: polybot_backtest
+    command: ["backtest", "--markets", "20", "--steps", "500"]
+    environment:
+      - ENABLE_LIVE_TRADING=false
+      - CONFIG_PATH=config/default.yaml
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    profiles: ["backtest"]
+
+  tests:
+    build: .
+    container_name: polybot_tests
+    entrypoint: ["python", "-m", "pytest"]
+    command: ["-v", "--tb=short", "-x", "tests/"]
+    environment:
+      - ENABLE_LIVE_TRADING=false
+    volumes:
+      - ./tests:/app/tests:ro
+      - ./logs:/app/logs
+    profiles: ["test"]
