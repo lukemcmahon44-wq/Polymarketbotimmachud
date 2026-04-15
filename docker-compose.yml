@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  polybot-paper:
+    build: .
+    container_name: polybot-paper
+    env_file: .env
+    environment:
+      - ENABLE_LIVE_TRADING=false
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+    command: ["run", "--paper"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import polymarket_bot; print('ok')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  polybot-backtest:
+    build: .
+    container_name: polybot-backtest
+    volumes:
+      - ./config:/app/config:ro
+      - ./backtest_results:/app/backtest_results
+    command: ["backtest", "--config", "/app/config/default.yaml"]
+    profiles: ["backtest"]
