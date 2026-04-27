@@ -1,0 +1,28 @@
+[Unit]
+Description=Kalshi x Polymarket Arb Bot (Belize VPN)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change WorkingDirectory to the absolute path of this repo on your machine
+WorkingDirectory=/opt/arb_bot
+
+# run_bot.sh must run as root to manage the VPN namespace;
+# it drops to the user specified by SUDO_USER internally
+User=root
+ExecStart=/bin/bash /opt/arb_bot/run_bot.sh
+
+# Auto-restart on any exit
+Restart=always
+RestartSec=15
+
+# Keep logs out of the journal (we write our own JSONL files),
+# but still capture stderr for systemd visibility
+StandardOutput=append:/opt/arb_bot/arb_bot/logs/service.log
+StandardError=append:/opt/arb_bot/arb_bot/logs/service.log
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
