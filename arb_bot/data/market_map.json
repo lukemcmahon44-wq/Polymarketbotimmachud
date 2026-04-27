@@ -1,0 +1,16 @@
+{
+  "_comment": "Manually verified Kalshi <-> Polymarket market pairs. These override fuzzy matching.",
+  "_guide": [
+    "kalshi_ticker: the exact Kalshi market ticker (e.g. PRES-2024-DJT)",
+    "polymarket_condition_id: the hex conditionId from Polymarket Gamma API",
+    "notes: free-text justification that resolution criteria are identical"
+  ],
+  "pairs": [
+    {
+      "_example": true,
+      "kalshi_ticker": "EXAMPLE-TICKER",
+      "polymarket_condition_id": "0xdeadbeef...",
+      "notes": "Both resolve on official AP call; same deadline; manually verified 2024-01-01"
+    }
+  ]
+}
