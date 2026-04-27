@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import asyncio
+import signal
 import sys
 
 import httpx
@@ -21,7 +22,6 @@ async def _check_polymarket_connectivity(clob_host: str, timeout: float) -> bool
     """Return True if the Polymarket CLOB API responds.
 
     This is the first thing that fails when a VPN is needed but not active.
-    We hit the root endpoint which requires no auth and returns quickly.
     """
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -50,7 +50,6 @@ async def main(dry_run: bool, dashboard: bool) -> None:
     from arb_bot.core.risk_manager import RiskManager
     from arb_bot.data.price_feed import PriceFeed
 
-    # Require explicit double opt-in for live trading
     if not dry_run and ENV_DRY_RUN:
         logger.error(
             "Live trading requested (--live) but DRY_RUN=true in .env. "
@@ -60,6 +59,23 @@ async def main(dry_run: bool, dashboard: bool) -> None:
 
     mode = "DRY RUN" if dry_run else "LIVE TRADING"
     logger.info(f"Starting arb bot | mode={mode} | categories={MARKET_CATEGORIES}")
+
+    # ------------------------------------------------------------------
+    # Graceful shutdown via asyncio.Event (SIGINT / SIGTERM)
+    # ------------------------------------------------------------------
+    shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown() -> None:
+        logger.info("Shutdown signal received")
+        shutdown.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown)
+        except NotImplementedError:
+            # Windows does not support add_signal_handler
+            pass
 
     # ------------------------------------------------------------------
     # VPN / connectivity check
@@ -114,7 +130,7 @@ async def main(dry_run: bool, dashboard: bool) -> None:
     # Start real-time price feeds
     # ------------------------------------------------------------------
     feed = PriceFeed(kalshi, poly, pairs)
-    asyncio.create_task(feed.start())
+    feed_task = asyncio.create_task(feed.start())
 
     # ------------------------------------------------------------------
     # Optionally start dashboard
@@ -130,14 +146,14 @@ async def main(dry_run: bool, dashboard: bool) -> None:
     await asyncio.sleep(2)
 
     # ------------------------------------------------------------------
-    # Main scan loop
+    # Main scan loop (event-driven: wakes on each WS price tick)
     # ------------------------------------------------------------------
     detector = ArbDetector(feed)
     pair_refresh_counter = 0
     PAIR_REFRESH_INTERVAL = int(1800 / SCAN_INTERVAL_SECONDS)  # ~30 min
 
-    logger.info("[BOT] Scan loop started")
-    while True:
+    logger.info("[BOT] Scan loop started (event-driven)")
+    while not shutdown.is_set():
         pair_refresh_counter += 1
         if pair_refresh_counter >= PAIR_REFRESH_INTERVAL:
             logger.info("Refreshing market pairs...")
@@ -170,7 +186,23 @@ async def main(dry_run: bool, dashboard: bool) -> None:
             )
             await execute_arb(opp, kalshi, poly, risk, dry_run=dry_run)
 
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        # Block until a price update arrives (or timeout for periodic refresh)
+        await feed.wait_for_price_change(timeout=SCAN_INTERVAL_SECONDS)
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+    logger.info("[BOT] Shutting down cleanly...")
+    feed_task.cancel()
+    try:
+        await feed_task
+    except asyncio.CancelledError:
+        pass
+    kalshi.stop_ws()
+    poly.stop_ws()
+    await kalshi.close()
+    await poly.close()
+    logger.info("[BOT] Shutdown complete")
 
 
 def cli() -> None:
@@ -192,7 +224,7 @@ def cli() -> None:
     try:
         asyncio.run(main(dry_run=not args.live, dashboard=not args.no_dashboard))
     except KeyboardInterrupt:
-        logger.info("Shutting down (KeyboardInterrupt)")
+        pass  # SIGINT already handled by shutdown event
 
 
 if __name__ == "__main__":
