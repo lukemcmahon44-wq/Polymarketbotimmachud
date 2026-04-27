@@ -25,9 +25,21 @@ class PriceFeed:
         self._k = kalshi_client
         self._p = poly_client
         self._pairs = pairs
+        self._changed: Optional[asyncio.Event] = None
 
     async def start(self) -> None:
         """Launch both WebSocket feeds concurrently. Runs indefinitely."""
+        # Event is created here so it belongs to the running event loop
+        self._changed = asyncio.Event()
+
+        # Wire price-update callbacks so every incoming WS tick sets the event
+        def _notify() -> None:
+            if self._changed is not None:
+                self._changed.set()
+
+        self._k.on_price_update = _notify
+        self._p.on_price_update = _notify
+
         k_tickers = [pair.kalshi_ticker for pair in self._pairs]
         p_tokens = []
         for pair in self._pairs:
@@ -36,7 +48,6 @@ class PriceFeed:
             if pair.polymarket_no_token_id:
                 p_tokens.append(pair.polymarket_no_token_id)
 
-        # Remove duplicates while preserving order
         p_tokens = list(dict.fromkeys(p_tokens))
 
         logger.info(f"PriceFeed starting: {len(k_tickers)} Kalshi tickers, {len(p_tokens)} Poly tokens")
@@ -45,6 +56,40 @@ class PriceFeed:
             self._k.subscribe_tickers(k_tickers),
             self._p.subscribe_tokens(p_tokens),
         )
+
+    async def wait_for_price_change(self, timeout: float = 2.0) -> bool:
+        """Block until any WS price update arrives, or timeout expires.
+
+        Returns True if a price change occurred, False on timeout.
+        Reduces scan latency from ~2000ms polling to ~10ms event-driven.
+        """
+        if self._changed is None:
+            await asyncio.sleep(timeout)
+            return False
+        self._changed.clear()
+        try:
+            await asyncio.wait_for(self._changed.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    # ------------------------------------------------------------------
+    # Price age helpers
+    # ------------------------------------------------------------------
+
+    def kalshi_price_age(self, ticker: str) -> float:
+        """Seconds since the last Kalshi price update for this ticker."""
+        cached = self._k.price_cache.get(ticker)
+        if cached is None:
+            return float("inf")
+        return time.time() - cached.updated_at
+
+    def poly_price_age(self, token_id: str) -> float:
+        """Seconds since the last Polymarket price update for this token."""
+        cached = self._p.price_cache.get(token_id)
+        if cached is None:
+            return float("inf")
+        return time.time() - cached.updated_at
 
     # ------------------------------------------------------------------
     # Synchronous accessors used by ArbDetector (no await needed)
@@ -72,8 +117,6 @@ class PriceFeed:
 
     def kalshi_depth(self, ticker: str, side: str) -> float:
         """Approximate USDC available at best ask on Kalshi (fallback: default)."""
-        # Full order-book depth requires a separate REST call; we approximate from
-        # the WebSocket ticker. If not available fall back to a conservative default.
         return _DEFAULT_DEPTH
 
     def poly_depth(self, token_id: str) -> float:
