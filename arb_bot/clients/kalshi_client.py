@@ -7,11 +7,10 @@ Prices are dollar strings (e.g. "0.6500") — never integer cents.
 import asyncio
 import base64
 import json
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -39,6 +38,32 @@ class MarketPrice:
     updated_at: float = field(default_factory=time.time)
 
 
+class _OrderRateLimiter:
+    """Token bucket: 9 calls/min (leaves headroom below Kalshi's 10/min write limit)."""
+
+    _CAPACITY = 9
+    _REFILL_RATE = 9 / 60.0  # tokens per second
+
+    def __init__(self) -> None:
+        self._tokens = float(self._CAPACITY)
+        self._last_refill = time.monotonic()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._CAPACITY, self._tokens + elapsed * self._REFILL_RATE)
+        self._last_refill = now
+
+    async def acquire(self) -> None:
+        while True:
+            self._refill()
+            if self._tokens >= 1:
+                self._tokens -= 1
+                return
+            wait = (1 - self._tokens) / self._REFILL_RATE
+            await asyncio.sleep(wait)
+
+
 class KalshiClient:
     def __init__(self, api_key_id: str, private_key_path: str, base_url: str, ws_url: str):
         self.api_key_id = api_key_id
@@ -48,6 +73,9 @@ class KalshiClient:
         self._http = httpx.AsyncClient(timeout=10.0)
         self.price_cache: dict[str, MarketPrice] = {}
         self._ws_running = False
+        self._rate_limiter = _OrderRateLimiter()
+        # Set to receive notification on every WS price update (used by PriceFeed)
+        self.on_price_update: Optional[Callable[[], None]] = None
 
     @classmethod
     def from_env(cls) -> "KalshiClient":
@@ -103,18 +131,23 @@ class KalshiClient:
 
     async def _get(self, endpoint: str, params: Optional[dict] = None) -> Any:
         url = f"{self.base_url}{endpoint}"
-        # Build the path including query string for signature (Kalshi requires full path)
-        path_for_sig = endpoint
-        headers = self._auth_headers("GET", path_for_sig)
+        headers = self._auth_headers("GET", endpoint)
         resp = await self._http.get(url, headers=headers, params=params)
         resp.raise_for_status()
         return resp.json()
 
     async def _post(self, endpoint: str, payload: dict) -> Any:
         body = json.dumps(payload)
-        headers = self._auth_headers("POST", endpoint, body)
         url = f"{self.base_url}{endpoint}"
-        resp = await self._http.post(url, headers=headers, content=body)
+        # Exponential backoff on 429 (Kalshi write rate-limit)
+        for attempt, backoff in enumerate([0, 1, 2, 4]):
+            if backoff:
+                logger.warning(f"Kalshi 429 on {endpoint} — retrying in {backoff}s")
+                await asyncio.sleep(backoff)
+            headers = self._auth_headers("POST", endpoint, body)
+            resp = await self._http.post(url, headers=headers, content=body)
+            if resp.status_code != 429 or attempt == 3:
+                break
         resp.raise_for_status()
         return resp.json()
 
@@ -153,14 +186,13 @@ class KalshiClient:
 
     async def get_balance(self) -> float:
         data = await self._get("/portfolio/balance")
-        # Returns balance in cents historically, but verify against live API
         return float(data.get("balance", 0))
 
     async def place_order(
         self,
         ticker: str,
-        side: str,          # "yes" | "no"
-        order_type: str,    # "market" | "limit"
+        side: str,
+        order_type: str,
         count: int,
         yes_price: Optional[float] = None,
         no_price: Optional[float] = None,
@@ -170,6 +202,7 @@ class KalshiClient:
         count = number of contracts (each contract settles at $1).
         Prices are fractional dollars (0.0 – 1.0).
         """
+        await self._rate_limiter.acquire()
         payload: dict = {
             "ticker": ticker,
             "action": "buy",
@@ -178,13 +211,13 @@ class KalshiClient:
             "count": count,
         }
         if yes_price is not None:
-            # API expects dollar string with up to 4 decimal places
             payload["yes_price"] = f"{yes_price:.4f}"
         if no_price is not None:
             payload["no_price"] = f"{no_price:.4f}"
         return await self._post("/portfolio/orders", payload)
 
     async def cancel_order(self, order_id: str) -> dict:
+        await self._rate_limiter.acquire()
         return await self._delete(f"/portfolio/orders/{order_id}")
 
     async def get_positions(self) -> list[dict]:
@@ -212,7 +245,6 @@ class KalshiClient:
         while self._ws_running:
             try:
                 async with websockets.connect(self.ws_url, extra_headers=extra_headers) as ws:
-                    # Subscribe to orderbook_delta for each ticker
                     sub_msg = {
                         "id": 1,
                         "cmd": "subscribe",
@@ -253,6 +285,12 @@ class KalshiClient:
         cached.no_bid = _parse(data.get("no_bid"))
         cached.last_price = _parse(data.get("last_price"))
         cached.updated_at = time.time()
+
+        if self.on_price_update is not None:
+            try:
+                self.on_price_update()
+            except Exception:
+                pass
 
     def stop_ws(self) -> None:
         self._ws_running = False
