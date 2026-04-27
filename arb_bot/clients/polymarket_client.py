@@ -8,7 +8,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -62,6 +62,8 @@ class PolymarketClient:
         self.price_cache: dict[str, PolyPrice] = {}
         self._ws_running = False
         self._http = httpx.AsyncClient(timeout=15.0)
+        # Set to receive notification on every WS price update (used by PriceFeed)
+        self.on_price_update: Optional[Callable[[], None]] = None
 
         if ClobClient is None:
             logger.warning("py-clob-client not installed — order placement disabled")
@@ -122,7 +124,6 @@ class PolymarketClient:
             "offset": offset,
             "closed": "false",
         }
-        # Gamma API accepts ?category=Sports  (capitalised)
         if categories and len(categories) == 1:
             params["category"] = categories[0].capitalize()
 
@@ -265,6 +266,12 @@ class PolymarketClient:
             except (TypeError, ValueError):
                 pass
         cached.updated_at = time.time()
+
+        if self.on_price_update is not None:
+            try:
+                self.on_price_update()
+            except Exception:
+                pass
 
     def stop_ws(self) -> None:
         self._ws_running = False
