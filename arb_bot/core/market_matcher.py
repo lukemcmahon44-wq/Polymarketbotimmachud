@@ -4,6 +4,10 @@ Resolution divergence is the primary risk in cross-platform arb.
 The government-shutdown 2024 case (Kalshi=NO, Polymarket=YES) is the
 canonical failure mode. This module flags pairs with divergent language
 before they ever reach the detector.
+
+Only markets matching MARKET_CATEGORIES (default: sports) are considered.
+Kalshi markets are filtered by their `category` field; Polymarket markets
+are requested with a category query param and also filtered client-side.
 """
 
 import json
@@ -37,6 +41,20 @@ _MEDIUM_RISK_PATTERNS = [
     r"as (reported|announced|declared)",
 ]
 
+# Kalshi category strings that map to sports
+_KALSHI_SPORTS_CATEGORIES = {
+    "sports", "football", "basketball", "baseball", "hockey",
+    "soccer", "tennis", "golf", "mma", "boxing", "racing",
+}
+
+# Title keyword fallback when category field is absent
+_SPORTS_TITLE_KEYWORDS = {
+    "nfl", "nba", "mlb", "nhl", "mls", "ufc", "fifa", "ncaa", "wnba", "pga",
+    "super bowl", "world series", "stanley cup", "nba finals", "march madness",
+    "premier league", "champions league", "world cup",
+    "playoffs", "playoff",
+}
+
 
 @dataclass
 class MarketPair:
@@ -46,7 +64,7 @@ class MarketPair:
     polymarket_yes_token_id: str
     polymarket_no_token_id: str
     polymarket_title: str
-    match_confidence: float          # 0–100
+    match_confidence: float          # 0-100
     resolution_risk: str             # "LOW" | "MEDIUM" | "HIGH"
     verified_manual: bool
 
@@ -75,14 +93,23 @@ class MarketMatcher:
         poly_client,
         fuzzy_threshold: int = 80,
     ) -> list[MarketPair]:
-        """Fetch live markets from both platforms and return matched pairs."""
-        logger.info("Fetching Kalshi markets...")
-        kalshi_markets = await kalshi_client.get_markets(limit=200, status="open")
-        logger.info(f"  Kalshi: {len(kalshi_markets)} open markets")
+        from arb_bot.config import MARKET_CATEGORIES
 
-        logger.info("Fetching Polymarket markets...")
-        poly_markets = await poly_client.get_markets(active=True, limit=100)
-        logger.info(f"  Polymarket: {len(poly_markets)} active markets")
+        logger.info(f"Fetching Kalshi markets (filter: {MARKET_CATEGORIES})...")
+        all_kalshi = await kalshi_client.get_markets(limit=200, status="open")
+        kalshi_markets = [
+            m for m in all_kalshi
+            if self._is_allowed_category(m.get("category", ""), m.get("title", ""), MARKET_CATEGORIES)
+        ]
+        logger.info(f"  Kalshi: {len(kalshi_markets)} sports markets (of {len(all_kalshi)} total)")
+
+        logger.info(f"Fetching Polymarket markets (filter: {MARKET_CATEGORIES})...")
+        all_poly = await poly_client.get_markets(active=True, limit=500, categories=MARKET_CATEGORIES)
+        poly_markets = [
+            m for m in all_poly
+            if self._is_allowed_category(m.get("category", ""), m.get("question", ""), MARKET_CATEGORIES)
+        ]
+        logger.info(f"  Polymarket: {len(poly_markets)} sports markets (of {len(all_poly)} total)")
 
         pairs = self._apply_manual_map(kalshi_markets, poly_markets)
         manual_tickers = {p.kalshi_ticker for p in pairs}
@@ -101,6 +128,37 @@ class MarketMatcher:
             f"{sum(not p.verified_manual for p in pairs)} fuzzy)"
         )
         return pairs
+
+    # ------------------------------------------------------------------
+    # Category filtering
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_allowed_category(
+        category: str,
+        title: str,
+        allowed: list[str],
+    ) -> bool:
+        """Return True if the market belongs to one of the allowed categories."""
+        if not allowed:
+            return True
+
+        cat_lower = category.strip().lower()
+
+        for c in allowed:
+            if c == "sports":
+                # Match any Kalshi sports sub-category or Polymarket "Sports"
+                if cat_lower in _KALSHI_SPORTS_CATEGORIES:
+                    return True
+                # Fallback: keyword scan of the title
+                title_lower = title.lower()
+                if any(kw in title_lower for kw in _SPORTS_TITLE_KEYWORDS):
+                    return True
+            else:
+                if c in cat_lower:
+                    return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Manual map
@@ -178,13 +236,7 @@ class MarketMatcher:
     # Pair construction helpers
     # ------------------------------------------------------------------
 
-    def _build_pair(
-        self,
-        km: dict,
-        pm: dict,
-        confidence: float,
-        manual: bool,
-    ) -> MarketPair:
+    def _build_pair(self, km: dict, pm: dict, confidence: float, manual: bool) -> MarketPair:
         tokens = pm.get("tokens", [])
         yes_token_id = ""
         no_token_id = ""
@@ -231,11 +283,8 @@ class MarketMatcher:
             if re.search(pattern, combined, re.IGNORECASE):
                 return "HIGH"
 
-        # Expiry divergence check (simple string comparison — upgrade if needed)
         if k_close and p_close:
-            k_date = k_close[:10]  # YYYY-MM-DD
-            p_date = p_close[:10]
-            if k_date != p_date:
+            if k_close[:10] != p_close[:10]:
                 return "MEDIUM"
 
         for pattern in _MEDIUM_RISK_PATTERNS:
@@ -247,7 +296,6 @@ class MarketMatcher:
     @staticmethod
     def _normalize(title: str) -> str:
         title = title.lower()
-        # Strip leading question words and punctuation
         title = re.sub(r"^(will|does|is|are|did|has|have|can|when|what|who)\s+", "", title)
         title = re.sub(r"[^a-z0-9\s]", " ", title)
         return re.sub(r"\s+", " ", title).strip()

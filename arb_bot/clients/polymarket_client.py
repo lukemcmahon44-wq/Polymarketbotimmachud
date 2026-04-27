@@ -71,7 +71,7 @@ class PolymarketClient:
                 clob_host,
                 key=private_key,
                 chain_id=chain_id,
-                signature_type=1,  # EIP-712
+                signature_type=1,
                 funder=funder_address,
             )
             try:
@@ -99,7 +99,7 @@ class PolymarketClient:
         )
 
     # ------------------------------------------------------------------
-    # Market data (Gamma API — no auth required)
+    # Market data (Gamma API)
     # ------------------------------------------------------------------
 
     async def get_markets(
@@ -107,15 +107,25 @@ class PolymarketClient:
         active: bool = True,
         limit: int = 100,
         offset: int = 0,
+        categories: Optional[list[str]] = None,
     ) -> list[dict]:
-        """Fetch markets from Gamma API with basic pagination."""
+        """Fetch markets from Gamma API.
+
+        If `categories` contains a single entry (e.g. ["sports"]), it is sent
+        as a `category=Sports` query param so the API pre-filters results.
+        Client-side filtering in market_matcher.py is applied on top.
+        """
         all_markets: list[dict] = []
-        params = {
+        params: dict = {
             "active": str(active).lower(),
             "limit": limit,
             "offset": offset,
             "closed": "false",
         }
+        # Gamma API accepts ?category=Sports  (capitalised)
+        if categories and len(categories) == 1:
+            params["category"] = categories[0].capitalize()
+
         while True:
             resp = await self._http.get(f"{self.gamma_host}/markets", params=params)
             resp.raise_for_status()
@@ -128,10 +138,10 @@ class PolymarketClient:
             if len(batch) < limit:
                 break
             params["offset"] = params["offset"] + limit  # type: ignore[operator]
+
         return all_markets
 
     async def get_orderbook(self, token_id: str) -> dict:
-        """Fetch CLOB order book for a YES or NO token."""
         resp = await self._http.get(
             f"{self.clob_host}/book",
             params={"token_id": token_id},
@@ -140,27 +150,23 @@ class PolymarketClient:
         return resp.json()
 
     async def get_price(self, token_id: str, side: str = "BUY") -> Optional[float]:
-        """Best ask (for BUY) or best bid (for SELL) from the CLOB."""
         try:
             resp = await self._http.get(
                 f"{self.clob_host}/price",
                 params={"token_id": token_id, "side": side.upper()},
             )
             resp.raise_for_status()
-            data = resp.json()
-            raw = data.get("price")
+            raw = resp.json().get("price")
             return float(raw) if raw is not None else None
         except Exception as exc:
             logger.debug(f"get_price({token_id}) failed: {exc}")
             return None
 
     async def get_balance(self) -> float:
-        """USDC balance on Polygon for the configured funder address."""
         if self._clob is None:
             return 0.0
         try:
-            balance = self._clob.get_balance()
-            return float(balance)
+            return float(self._clob.get_balance())
         except Exception as exc:
             logger.warning(f"Polymarket get_balance failed: {exc}")
             return 0.0
@@ -175,11 +181,10 @@ class PolymarketClient:
         amount_usdc: float,
         side: str = "BUY",
     ) -> dict:
-        """Fill-or-Kill market order spending `amount_usdc` of USDC."""
         if self._clob is None:
             raise RuntimeError("py-clob-client not available")
         order_args = OrderArgs(
-            price=1.0,  # ignored for market orders; use amount
+            price=1.0,
             size=amount_usdc,
             side=BUY if side.upper() == "BUY" else SELL,
             token_id=token_id,
@@ -194,7 +199,6 @@ class PolymarketClient:
         size: float,
         side: str = "BUY",
     ) -> dict:
-        """GTC limit order."""
         if self._clob is None:
             raise RuntimeError("py-clob-client not available")
         order_args = OrderArgs(
@@ -220,7 +224,6 @@ class PolymarketClient:
     # ------------------------------------------------------------------
 
     async def subscribe_tokens(self, token_ids: list[str]) -> None:
-        """Open WebSocket and maintain live price cache. Runs until cancelled."""
         if websockets is None:
             raise RuntimeError("websockets package not installed")
 
@@ -229,7 +232,7 @@ class PolymarketClient:
             try:
                 async with websockets.connect(self._WS_URL) as ws:
                     sub = {
-                        "auth": {},  # public channel, no auth needed
+                        "auth": {},
                         "type": "market",
                         "assets_ids": token_ids,
                     }
@@ -247,13 +250,10 @@ class PolymarketClient:
         event_type = msg.get("event_type") or msg.get("type")
         if event_type not in ("price_change", "book", "tick"):
             return
-
         token_id = msg.get("asset_id") or msg.get("token_id")
         if not token_id:
             return
-
         cached = self.price_cache.setdefault(token_id, PolyPrice(token_id=token_id))
-
         if "best_ask" in msg:
             try:
                 cached.best_ask = float(msg["best_ask"])
@@ -264,7 +264,6 @@ class PolymarketClient:
                 cached.best_bid = float(msg["best_bid"])
             except (TypeError, ValueError):
                 pass
-
         cached.updated_at = time.time()
 
     def stop_ws(self) -> None:
