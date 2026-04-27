@@ -1,13 +1,12 @@
 """Two-layer market matching: curated JSON override + fuzzy text matching.
 
-Resolution divergence is the primary risk in cross-platform arb.
-The government-shutdown 2024 case (Kalshi=NO, Polymarket=YES) is the
-canonical failure mode. This module flags pairs with divergent language
-before they ever reach the detector.
+Resolution divergence is the #1 risk in cross-platform arb. Only markets
+matching MARKET_CATEGORIES (default: sports) are considered.
 
-Only markets matching MARKET_CATEGORIES (default: sports) are considered.
-Kalshi markets are filtered by their `category` field; Polymarket markets
-are requested with a category query param and also filtered client-side.
+HIGH-RISK patterns are deliberately narrow: only genuine oracle-governance
+risks where the *platform* can resolve against the obvious game result.
+"Official" language is NOT flagged — in sports it always means the final
+game/league result, not an ambiguous government or regulatory source.
 """
 
 import json
@@ -25,20 +24,29 @@ from arb_bot.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Resolution-risk trigger phrases
+# ---------------------------------------------------------------------------
+# Resolution-risk patterns
+# HIGH  -> never trade (oracle/governance risk where platform overrides result)
+# MEDIUM -> trade only if manual-verified
+# ---------------------------------------------------------------------------
 _HIGH_RISK_PATTERNS = [
-    r"official",
-    r"per \w+ (report|data|release)",
-    r"exceed(?:ing|s) .{1,20} hours",
-    r"occurring",
-    r"community\s+resolution",
-    r"UMA\s+oracle",
+    # UMA oracle / community governance — can vote against the obvious outcome
     r"\bUMA\b",
+    r"UMA\s+oracle",
+    r"community\s+resolution",
+    r"admin(?:istrator)?\s+resolution",
+    # Explicit third-party resolution with named non-sports arbiter
+    r"resolves?\s+per\s+(?:CFTC|SEC|Fed(?:eral)?|government|court)",
 ]
+
 _MEDIUM_RISK_PATTERNS = [
-    r"by (?:end of|close of|eod)",
-    r"according to",
-    r"as (reported|announced|declared)",
+    # Game scheduling risk — postponement/cancellation handled differently per platform
+    r"postpone[d]?",
+    r"cancel(?:le?d)?",
+    r"(?:rain|weather)\s*delay",
+    # Timing-dependent language that can differ in interpretation
+    r"by\s+(?:end\s+of|close\s+of|eod)\b",
+    r"before\s+(?:end|close)\s+of",
 ]
 
 # Kalshi category strings that map to sports
@@ -99,17 +107,29 @@ class MarketMatcher:
         all_kalshi = await kalshi_client.get_markets(limit=200, status="open")
         kalshi_markets = [
             m for m in all_kalshi
-            if self._is_allowed_category(m.get("category", ""), m.get("title", ""), MARKET_CATEGORIES)
+            if self._is_allowed_category(
+                m.get("category", ""), m.get("title", ""), MARKET_CATEGORIES
+            )
         ]
-        logger.info(f"  Kalshi: {len(kalshi_markets)} sports markets (of {len(all_kalshi)} total)")
+        logger.info(
+            f"  Kalshi: {len(kalshi_markets)} sports markets "
+            f"(of {len(all_kalshi)} total)"
+        )
 
         logger.info(f"Fetching Polymarket markets (filter: {MARKET_CATEGORIES})...")
-        all_poly = await poly_client.get_markets(active=True, limit=500, categories=MARKET_CATEGORIES)
+        all_poly = await poly_client.get_markets(
+            active=True, limit=500, categories=MARKET_CATEGORIES
+        )
         poly_markets = [
             m for m in all_poly
-            if self._is_allowed_category(m.get("category", ""), m.get("question", ""), MARKET_CATEGORIES)
+            if self._is_allowed_category(
+                m.get("category", ""), m.get("question", ""), MARKET_CATEGORIES
+            )
         ]
-        logger.info(f"  Polymarket: {len(poly_markets)} sports markets (of {len(all_poly)} total)")
+        logger.info(
+            f"  Polymarket: {len(poly_markets)} sports markets "
+            f"(of {len(all_poly)} total)"
+        )
 
         pairs = self._apply_manual_map(kalshi_markets, poly_markets)
         manual_tickers = {p.kalshi_ticker for p in pairs}
@@ -117,10 +137,11 @@ class MarketMatcher:
         if fuzz is None:
             logger.warning("rapidfuzz not installed; skipping fuzzy matching")
         else:
-            auto_pairs = self._fuzzy_match(
-                kalshi_markets, poly_markets, fuzzy_threshold, manual_tickers
+            pairs.extend(
+                self._fuzzy_match(
+                    kalshi_markets, poly_markets, fuzzy_threshold, manual_tickers
+                )
             )
-            pairs.extend(auto_pairs)
 
         logger.info(
             f"Matched {len(pairs)} pairs "
@@ -134,30 +155,18 @@ class MarketMatcher:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _is_allowed_category(
-        category: str,
-        title: str,
-        allowed: list[str],
-    ) -> bool:
-        """Return True if the market belongs to one of the allowed categories."""
+    def _is_allowed_category(category: str, title: str, allowed: list[str]) -> bool:
         if not allowed:
             return True
-
         cat_lower = category.strip().lower()
-
         for c in allowed:
             if c == "sports":
-                # Match any Kalshi sports sub-category or Polymarket "Sports"
                 if cat_lower in _KALSHI_SPORTS_CATEGORIES:
                     return True
-                # Fallback: keyword scan of the title
-                title_lower = title.lower()
-                if any(kw in title_lower for kw in _SPORTS_TITLE_KEYWORDS):
+                if any(kw in title.lower() for kw in _SPORTS_TITLE_KEYWORDS):
                     return True
-            else:
-                if c in cat_lower:
-                    return True
-
+            elif c in cat_lower:
+                return True
         return False
 
     # ------------------------------------------------------------------
@@ -170,28 +179,22 @@ class MarketMatcher:
             return []
         try:
             with open(path) as fh:
-                data = json.load(fh)
-            return data.get("pairs", [])
+                return json.load(fh).get("pairs", [])
         except Exception as exc:
             logger.warning(f"Could not load market_map.json: {exc}")
             return []
 
     def _apply_manual_map(
-        self,
-        kalshi_markets: list[dict],
-        poly_markets: list[dict],
+        self, kalshi_markets: list[dict], poly_markets: list[dict]
     ) -> list[MarketPair]:
-        k_by_ticker = {m["ticker"]: m for m in kalshi_markets if "ticker" in m}
+        k_by_ticker    = {m["ticker"]: m for m in kalshi_markets if "ticker" in m}
         p_by_condition = {m.get("conditionId", ""): m for m in poly_markets}
 
         pairs: list[MarketPair] = []
         for entry in self._manual_map:
-            k_ticker = entry.get("kalshi_ticker", "")
-            p_cid = entry.get("polymarket_condition_id", "")
-            km = k_by_ticker.get(k_ticker)
-            pm = p_by_condition.get(p_cid)
+            km = k_by_ticker.get(entry.get("kalshi_ticker", ""))
+            pm = p_by_condition.get(entry.get("polymarket_condition_id", ""))
             if km is None or pm is None:
-                logger.debug(f"Manual map entry not found in live markets: {k_ticker} / {p_cid}")
                 continue
             pairs.append(self._build_pair(km, pm, confidence=100.0, manual=True))
         return pairs
@@ -216,31 +219,30 @@ class MarketMatcher:
             if not k_title:
                 continue
 
-            best_pm = None
-            best_score = 0
+            best_pm, best_score = None, 0
             for pm in poly_markets:
                 p_title = self._normalize(pm.get("question", ""))
                 if not p_title:
                     continue
                 score = fuzz.token_sort_ratio(k_title, p_title)
                 if score > best_score:
-                    best_score = score
-                    best_pm = pm
+                    best_score, best_pm = score, pm
 
             if best_pm is not None and best_score >= threshold:
-                pairs.append(self._build_pair(km, best_pm, confidence=float(best_score), manual=False))
-
+                pairs.append(
+                    self._build_pair(km, best_pm, confidence=float(best_score), manual=False)
+                )
         return pairs
 
     # ------------------------------------------------------------------
-    # Pair construction helpers
+    # Pair construction
     # ------------------------------------------------------------------
 
-    def _build_pair(self, km: dict, pm: dict, confidence: float, manual: bool) -> MarketPair:
-        tokens = pm.get("tokens", [])
-        yes_token_id = ""
-        no_token_id = ""
-        for t in tokens:
+    def _build_pair(
+        self, km: dict, pm: dict, confidence: float, manual: bool
+    ) -> MarketPair:
+        yes_token_id = no_token_id = ""
+        for t in pm.get("tokens", []):
             outcome = (t.get("outcome") or "").upper()
             if outcome == "YES":
                 yes_token_id = t.get("token_id", "")
@@ -253,7 +255,6 @@ class MarketMatcher:
             km.get("close_time", ""),
             pm.get("endDate", ""),
         )
-
         return MarketPair(
             kalshi_ticker=km.get("ticker", ""),
             kalshi_title=km.get("title", ""),
@@ -272,23 +273,20 @@ class MarketMatcher:
 
     @staticmethod
     def _assess_resolution_risk(
-        kalshi_title: str,
-        poly_title: str,
-        k_close: str,
-        p_close: str,
+        kalshi_title: str, poly_title: str, k_close: str, p_close: str
     ) -> str:
         combined = f"{kalshi_title} {poly_title}".lower()
 
-        for pattern in _HIGH_RISK_PATTERNS:
-            if re.search(pattern, combined, re.IGNORECASE):
+        for pat in _HIGH_RISK_PATTERNS:
+            if re.search(pat, combined, re.IGNORECASE):
                 return "HIGH"
 
-        if k_close and p_close:
-            if k_close[:10] != p_close[:10]:
-                return "MEDIUM"
+        # Expiry mismatch > 0 days → MEDIUM (different events or rolling dates)
+        if k_close and p_close and k_close[:10] != p_close[:10]:
+            return "MEDIUM"
 
-        for pattern in _MEDIUM_RISK_PATTERNS:
-            if re.search(pattern, combined, re.IGNORECASE):
+        for pat in _MEDIUM_RISK_PATTERNS:
+            if re.search(pat, combined, re.IGNORECASE):
                 return "MEDIUM"
 
         return "LOW"
