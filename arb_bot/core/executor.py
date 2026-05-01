@@ -9,6 +9,14 @@ Correct position sizing for binary arb:
   kalshi_spend = N * k_price
   poly_spend   = N * p_price
   total_spend  = N * (k_price + p_price) = total_budget  (exact, before rounding)
+
+Half-fill recovery:
+  If only one leg fills, we are unhedged and exposed to the full underlying
+  outcome. The recovery path attempts (in order):
+    1. cancel_order — succeeds for resting/unfilled limit orders.
+    2. counter market order — actively flattens a filled position by selling
+       the same count back to the book. Caps the loss to ~spread × count.
+  If both fail, an alert is raised for manual review.
 """
 
 import asyncio
@@ -40,7 +48,6 @@ class TradeResult:
     executed_at: datetime
 
 
-# In-memory trade log — append-only
 _trade_log: list[TradeResult] = []
 
 
@@ -57,21 +64,20 @@ async def execute_arb(
 ) -> Optional[TradeResult]:
     from arb_bot.config import MAX_POSITION_PER_MARKET
 
-    # Drop stale opportunities — prices may have moved since the scan.
     opp_age = (datetime.utcnow() - opp.timestamp).total_seconds()
     if opp_age > _MAX_OPP_AGE_SECS:
         logger.debug(f"Opportunity stale ({opp_age:.2f}s old) — skipping {opp.pair.kalshi_ticker}")
         return None
 
     # ------------------------------------------------------------------ #
-    # Position sizing                                                       #
-    # Each contract pair (1 Kalshi + 1 Poly) costs (k_price + p_price)    #
-    # and guarantees a $1 payout. Round down to whole contracts.           #
+    # Position sizing                                                    #
+    # Each contract pair (1 Kalshi + 1 Poly) costs (k_price + p_price)   #
+    # and guarantees a $1 payout. Round down to whole contracts.         #
     # ------------------------------------------------------------------ #
     total_budget = min(opp.max_size_usdc, MAX_POSITION_PER_MARKET)
     k_contracts = max(1, int(total_budget / (opp.kalshi_price + opp.polymarket_price)))
     kalshi_spend = k_contracts * opp.kalshi_price
-    poly_spend   = k_contracts * opp.polymarket_price
+    poly_spend = k_contracts * opp.polymarket_price
 
     p_token_id = (
         opp.pair.polymarket_yes_token_id
@@ -120,7 +126,7 @@ async def execute_arb(
     poly_task = asyncio.create_task(
         poly_client.place_market_order(
             token_id=p_token_id,
-            amount_usdc=poly_spend,   # spend only the Poly leg's share
+            amount_usdc=poly_spend,
         )
     )
 
@@ -129,15 +135,24 @@ async def execute_arb(
     )
 
     k_failed = isinstance(kalshi_result, BaseException)
-    p_failed  = isinstance(poly_result,  BaseException)
+    p_failed = isinstance(poly_result, BaseException)
 
     if k_failed or p_failed:
-        err = _fmt_errors(kalshi_result if k_failed else None,
-                          poly_result  if p_failed else None)
+        err = _fmt_errors(
+            kalshi_result if k_failed else None,
+            poly_result if p_failed else None,
+        )
         logger.error(f"[PARTIAL FILL] {err}")
         await _handle_partial_fill(
-            k_failed, p_failed, kalshi_result, poly_result,
-            opp, kalshi_client, risk_manager,
+            k_failed,
+            p_failed,
+            kalshi_result,
+            poly_result,
+            opp,
+            k_contracts,
+            kalshi_client,
+            poly_client,
+            risk_manager,
         )
         result = TradeResult(
             opportunity=opp,
@@ -145,7 +160,7 @@ async def execute_arb(
             kalshi_spend=kalshi_spend,
             poly_spend=poly_spend,
             kalshi_order=None if k_failed else kalshi_result,
-            poly_order=None  if p_failed else poly_result,
+            poly_order=None if p_failed else poly_result,
             success=False,
             partial=True,
             error=err,
@@ -183,7 +198,9 @@ async def _handle_partial_fill(
     k_result,
     p_result,
     opp: ArbOpportunity,
+    k_contracts: int,
     kalshi_client,
+    poly_client,
     risk_manager,
 ) -> None:
     msg = (
@@ -193,22 +210,85 @@ async def _handle_partial_fill(
     )
     await send_alert(f"\U0001f6a8 {msg}")
 
-    # Attempt to cancel the Kalshi leg if it filled (Poly FOK either fills or
-    # self-cancels, so no reversal needed on that side).
     if not k_failed and isinstance(k_result, dict):
-        oid = _order_id(k_result)
-        if oid != "?":
-            try:
-                await kalshi_client.cancel_order(oid)
-                logger.info(f"Cancelled Kalshi order {oid} after partial fill")
-            except Exception as exc:
-                logger.error(f"CANNOT cancel Kalshi order {oid}: {exc}")
-                logger.error("MANUAL REVIEW REQUIRED — unhedged Kalshi position")
-                await send_alert(
-                    f"⛔ MANUAL: Kalshi order {oid} on {opp.pair.kalshi_ticker} UNHEDGED"
-                )
+        await _flatten_kalshi(k_result, opp, k_contracts, kalshi_client)
+
+    if not p_failed and isinstance(p_result, dict):
+        await _flatten_polymarket(p_result, opp, k_contracts, poly_client)
 
     risk_manager.on_partial_fill(opp)
+
+
+async def _flatten_kalshi(
+    order_result: dict,
+    opp: ArbOpportunity,
+    k_contracts: int,
+    kalshi_client,
+) -> None:
+    """Cancel a resting order; if already filled, sell the position back."""
+    oid = _order_id(order_result)
+
+    # Step 1: try cancel (works for resting orders only)
+    if oid != "?":
+        try:
+            await kalshi_client.cancel_order(oid)
+            logger.info(f"Cancelled Kalshi order {oid}")
+            return
+        except Exception as exc:
+            logger.warning(f"Kalshi cancel {oid} failed ({exc}); attempting active flatten")
+
+    # Step 2: market sell to flatten an already-filled position
+    try:
+        await kalshi_client.place_order(
+            ticker=opp.pair.kalshi_ticker,
+            side=opp.kalshi_leg.lower(),
+            order_type="market",
+            count=k_contracts,
+            action="sell",
+        )
+        logger.info(
+            f"Flattened Kalshi position via SELL {k_contracts}×{opp.kalshi_leg} "
+            f"on {opp.pair.kalshi_ticker}"
+        )
+    except Exception as exc:
+        logger.error(f"CANNOT flatten Kalshi position on {opp.pair.kalshi_ticker}: {exc}")
+        await send_alert(
+            f"⛔ MANUAL: Kalshi {k_contracts}×{opp.kalshi_leg} on "
+            f"{opp.pair.kalshi_ticker} UNHEDGED — review immediately"
+        )
+
+
+async def _flatten_polymarket(
+    order_result: dict,
+    opp: ArbOpportunity,
+    k_contracts: int,
+    poly_client,
+) -> None:
+    """Polymarket FOK either fills fully or self-cancels. If it filled, sell back."""
+    status = (order_result.get("status") or "").lower()
+    if status in ("cancelled", "canceled", "unfilled", "rejected", ""):
+        return  # nothing to flatten
+
+    p_token_id = (
+        opp.pair.polymarket_yes_token_id
+        if opp.polymarket_leg == "YES"
+        else opp.pair.polymarket_no_token_id
+    )
+    try:
+        await poly_client.place_market_order(
+            token_id=p_token_id,
+            amount_usdc=float(k_contracts),  # selling N tokens, expect ~N*price proceeds
+            side="SELL",
+        )
+        logger.info(
+            f"Flattened Polymarket position via SELL {k_contracts}×{opp.polymarket_leg}"
+        )
+    except Exception as exc:
+        logger.error(f"CANNOT flatten Polymarket position on {p_token_id}: {exc}")
+        await send_alert(
+            f"⛔ MANUAL: Polymarket {k_contracts}×{opp.polymarket_leg} "
+            f"on {p_token_id[:8]}… UNHEDGED — review immediately"
+        )
 
 
 def _order_id(result) -> str:
