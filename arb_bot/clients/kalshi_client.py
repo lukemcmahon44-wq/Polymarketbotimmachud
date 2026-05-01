@@ -139,7 +139,6 @@ class KalshiClient:
     async def _post(self, endpoint: str, payload: dict) -> Any:
         body = json.dumps(payload)
         url = f"{self.base_url}{endpoint}"
-        # Exponential backoff on 429 (Kalshi write rate-limit)
         for attempt, backoff in enumerate([0, 1, 2, 4]):
             if backoff:
                 logger.warning(f"Kalshi 429 on {endpoint} — retrying in {backoff}s")
@@ -196,16 +195,18 @@ class KalshiClient:
         count: int,
         yes_price: Optional[float] = None,
         no_price: Optional[float] = None,
+        action: str = "buy",
     ) -> dict:
         """
-        Place a buy order.
+        Place an order.
+        action = "buy" | "sell" (used by half-fill flatten logic).
         count = number of contracts (each contract settles at $1).
         Prices are fractional dollars (0.0 – 1.0).
         """
         await self._rate_limiter.acquire()
         payload: dict = {
             "ticker": ticker,
-            "action": "buy",
+            "action": action.lower(),
             "side": side.lower(),
             "type": order_type.lower(),
             "count": count,
