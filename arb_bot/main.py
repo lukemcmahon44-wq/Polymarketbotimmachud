@@ -47,6 +47,7 @@ async def main(dry_run: bool, dashboard: bool) -> None:
     from arb_bot.core.arb_detector import ArbDetector
     from arb_bot.core.executor import execute_arb
     from arb_bot.core.market_matcher import MarketMatcher
+    from arb_bot.core.position_tracker import PositionTracker
     from arb_bot.core.risk_manager import RiskManager
     from arb_bot.data.price_feed import PriceFeed
 
@@ -74,7 +75,6 @@ async def main(dry_run: bool, dashboard: bool) -> None:
         try:
             loop.add_signal_handler(sig, _request_shutdown)
         except NotImplementedError:
-            # Windows does not support add_signal_handler
             pass
 
     # ------------------------------------------------------------------
@@ -112,6 +112,13 @@ async def main(dry_run: bool, dashboard: bool) -> None:
 
     poly = PolymarketClient.from_env()
     risk = RiskManager()
+    tracker = PositionTracker()
+    open_positions = tracker.all()
+    if open_positions:
+        logger.info(
+            f"Resumed {len(open_positions)} open position(s) from disk "
+            f"(locked profit: ${tracker.locked_profit():.2f})"
+        )
 
     # ------------------------------------------------------------------
     # Build initial market pairs
@@ -142,7 +149,6 @@ async def main(dry_run: bool, dashboard: bool) -> None:
         )
         logger.info(f"Dashboard: http://{DASHBOARD_HOST}:{DASHBOARD_PORT}")
 
-    # Allow WebSocket connections to establish before first scan
     await asyncio.sleep(2)
 
     # ------------------------------------------------------------------
@@ -180,13 +186,17 @@ async def main(dry_run: bool, dashboard: bool) -> None:
                 logger.debug(f"Skipped ({reason}): {opp.pair.kalshi_ticker}")
                 continue
 
+            # Avoid stacking onto an already-open position for the same market
+            if tracker.get(opp.pair.kalshi_ticker) is not None:
+                logger.debug(f"Already holding {opp.pair.kalshi_ticker}; skipping")
+                continue
+
             logger.info(
                 f"[ARB] {opp.pair.kalshi_title[:50]} | "
                 f"edge={opp.net_edge:.2%} size=${opp.max_size_usdc:.0f}"
             )
-            await execute_arb(opp, kalshi, poly, risk, dry_run=dry_run)
+            await execute_arb(opp, kalshi, poly, risk, dry_run=dry_run, tracker=tracker)
 
-        # Block until a price update arrives (or timeout for periodic refresh)
         await feed.wait_for_price_change(timeout=SCAN_INTERVAL_SECONDS)
 
     # ------------------------------------------------------------------
@@ -224,7 +234,7 @@ def cli() -> None:
     try:
         asyncio.run(main(dry_run=not args.live, dashboard=not args.no_dashboard))
     except KeyboardInterrupt:
-        pass  # SIGINT already handled by shutdown event
+        pass
 
 
 if __name__ == "__main__":
