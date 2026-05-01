@@ -11,12 +11,14 @@ Correct position sizing for binary arb:
   total_spend  = N * (k_price + p_price) = total_budget  (exact, before rounding)
 
 Half-fill recovery:
-  If only one leg fills, we are unhedged and exposed to the full underlying
-  outcome. The recovery path attempts (in order):
+  If only one leg fills, we are unhedged. The recovery path attempts:
     1. cancel_order — succeeds for resting/unfilled limit orders.
-    2. counter market order — actively flattens a filled position by selling
-       the same count back to the book. Caps the loss to ~spread × count.
+    2. counter market order — actively flattens a filled position.
   If both fail, an alert is raised for manual review.
+
+Position tracking:
+  When a tracker is provided, every successfully filled arb is persisted to
+  disk so the bot can resume open positions across restarts.
 """
 
 import asyncio
@@ -25,12 +27,12 @@ from datetime import datetime
 from typing import Optional
 
 from arb_bot.core.arb_detector import ArbOpportunity
+from arb_bot.core.position_tracker import Position, PositionTracker
 from arb_bot.utils.alert import send_alert
 from arb_bot.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Skip execution if the opportunity is older than this (prices may have moved)
 _MAX_OPP_AGE_SECS = 1.5
 
 
@@ -61,6 +63,7 @@ async def execute_arb(
     poly_client,
     risk_manager,
     dry_run: bool = True,
+    tracker: Optional[PositionTracker] = None,
 ) -> Optional[TradeResult]:
     from arb_bot.config import MAX_POSITION_PER_MARKET
 
@@ -69,11 +72,6 @@ async def execute_arb(
         logger.debug(f"Opportunity stale ({opp_age:.2f}s old) — skipping {opp.pair.kalshi_ticker}")
         return None
 
-    # ------------------------------------------------------------------ #
-    # Position sizing                                                    #
-    # Each contract pair (1 Kalshi + 1 Poly) costs (k_price + p_price)   #
-    # and guarantees a $1 payout. Round down to whole contracts.         #
-    # ------------------------------------------------------------------ #
     total_budget = min(opp.max_size_usdc, MAX_POSITION_PER_MARKET)
     k_contracts = max(1, int(total_budget / (opp.kalshi_price + opp.polymarket_price)))
     kalshi_spend = k_contracts * opp.kalshi_price
@@ -189,6 +187,23 @@ async def execute_arb(
     )
     _trade_log.append(result)
     risk_manager.post_trade_update(opp, kalshi_spend + poly_spend, success=True)
+
+    if tracker is not None:
+        try:
+            tracker.add(
+                Position(
+                    kalshi_ticker=opp.pair.kalshi_ticker,
+                    polymarket_condition_id=opp.pair.polymarket_condition_id,
+                    k_contracts=k_contracts,
+                    kalshi_spend=kalshi_spend,
+                    poly_spend=poly_spend,
+                    kalshi_price=opp.kalshi_price,
+                    polymarket_price=opp.polymarket_price,
+                )
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to persist position for {opp.pair.kalshi_ticker}: {exc}")
+
     return result
 
 
@@ -228,7 +243,6 @@ async def _flatten_kalshi(
     """Cancel a resting order; if already filled, sell the position back."""
     oid = _order_id(order_result)
 
-    # Step 1: try cancel (works for resting orders only)
     if oid != "?":
         try:
             await kalshi_client.cancel_order(oid)
@@ -237,7 +251,6 @@ async def _flatten_kalshi(
         except Exception as exc:
             logger.warning(f"Kalshi cancel {oid} failed ({exc}); attempting active flatten")
 
-    # Step 2: market sell to flatten an already-filled position
     try:
         await kalshi_client.place_order(
             ticker=opp.pair.kalshi_ticker,
@@ -267,7 +280,7 @@ async def _flatten_polymarket(
     """Polymarket FOK either fills fully or self-cancels. If it filled, sell back."""
     status = (order_result.get("status") or "").lower()
     if status in ("cancelled", "canceled", "unfilled", "rejected", ""):
-        return  # nothing to flatten
+        return
 
     p_token_id = (
         opp.pair.polymarket_yes_token_id
@@ -277,7 +290,7 @@ async def _flatten_polymarket(
     try:
         await poly_client.place_market_order(
             token_id=p_token_id,
-            amount_usdc=float(k_contracts),  # selling N tokens, expect ~N*price proceeds
+            amount_usdc=float(k_contracts),
             side="SELL",
         )
         logger.info(
